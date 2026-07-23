@@ -21,6 +21,7 @@ import csv
 import html
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -36,6 +37,16 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Make a bundled copy of dnspython importable no matter where this project
+# folder is moved to. We check the common spots relative to THIS script, so MX
+# validation "just works" on any machine/path (and finds a `pip --target`
+# install placed in a dnspython/ or Apps/dnspython/ folder next to the code).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in ("dnspython", os.path.join("Apps", "dnspython")):
+    _dns_path = os.path.join(_HERE, _candidate)
+    if os.path.isdir(_dns_path) and _dns_path not in sys.path:
+        sys.path.insert(0, _dns_path)
 
 try:  # Optional: only used if installed. Never a hard dependency.
     import dns.resolver as _dns_resolver
