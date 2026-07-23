@@ -1,6 +1,0 @@
-requests>=2.31
-python-dotenv>=1.0
-beautifulsoup4>=4.12
-# Optional: enables MX validation in website_crawler.py (dead domains dropped).
-# The crawler runs fine without it -- validation simply turns off.
-dnspython>=2.4
