@@ -54,6 +54,26 @@ PAGE_TOKEN_DELAY_SECONDS = 2.5
 # Small courtesy pause between cities.
 BETWEEN_CITY_DELAY_SECONDS = 0.5
 
+# --- Rate-limit handling: lets the harvester run UNATTENDED all night. ---
+# Steady pace between requests so we stay under Google's per-minute limit.
+REQUEST_SPACING_SECONDS = 2.0
+# On a 429, wait this long, doubling each time up to the cap, then retry.
+INITIAL_BACKOFF_SECONDS = 20
+MAX_BACKOFF_SECONDS = 300  # never wait more than 5 minutes between retries
+# Give up (clean stop, progress saved) only after being CONTINUOUSLY rate-
+# limited this long. Big enough to ride out a per-minute limit and even a daily
+# quota reset, so an overnight run resumes on its own without a re-launch.
+MAX_CONTINUOUS_STALL_SECONDS = 3 * 3600
+
+# Response-body markers that mean the key is genuinely dead -> stop immediately.
+_TERMINAL_MARKERS = (
+    "permission_denied", "billing", "api key not valid", "api_key not valid",
+    "api key expired", "expired", "disabled", "suspended", "not authorized",
+    "consumer_invalid",
+)
+# Markers that mean "slow down / temporarily out" -> back off and retry.
+_RATELIMIT_MARKERS = ("resource_exhausted", "rate limit", "too many requests", "quota")
+
 # OPTIONAL SAFETY CAP on API requests per run. None = run until the key/quota
 # actually runs out (what you asked for). On a PAID billing account that means
 # it keeps spending until Google's own quota/billing limit is hit, so if you
@@ -84,7 +104,15 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class QuotaExhausted(RuntimeError):
-    """Raised when Google signals the API key/quota is spent -- our stop signal."""
+    """Terminal: the key/billing is genuinely dead (not a temporary rate limit)."""
+
+
+class RateLimited(RuntimeError):
+    """Transient: Google asked us to slow down (HTTP 429). Back off and retry."""
+
+    def __init__(self, retry_after: int | None = None) -> None:
+        super().__init__("rate limited")
+        self.retry_after = retry_after
 
 
 class LosAngelesFormatter(logging.Formatter):
@@ -156,8 +184,8 @@ def save_progress(progress: dict[str, Any]) -> None:
     PROGRESS_FILE.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
 
-def request_page(api_key: str, query_text: str, page_token: str | None) -> dict[str, Any]:
-    """Run one Places Text Search request; raise QuotaExhausted when spent."""
+def _perform_request(api_key: str, query_text: str, page_token: str | None) -> dict[str, Any]:
+    """One raw Places Text Search call. Classifies failures as terminal vs retryable."""
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -177,18 +205,48 @@ def request_page(api_key: str, query_text: str, page_token: str | None) -> dict[
 
     response = requests.post(PLACES_TEXT_SEARCH_URL, headers=headers, json=body, timeout=(10, 30))
 
-    # Quota / key exhaustion -> clean, intentional stop.
     if response.status_code == 429:
-        raise QuotaExhausted("HTTP 429 RESOURCE_EXHAUSTED (quota or rate limit reached)")
+        # Almost always a per-minute rate limit: retryable, NOT the end.
+        retry_after = response.headers.get("Retry-After", "").strip()
+        raise RateLimited(int(retry_after) if retry_after.isdigit() else None)
+
     if response.status_code in (403, 400):
         body_text = response.text.lower()
-        markers = ("resource_exhausted", "quota", "billing", "permission_denied",
-                   "api key", "api_key not valid", "expired", "disabled")
-        if any(marker in body_text for marker in markers):
+        if any(marker in body_text for marker in _TERMINAL_MARKERS):
             raise QuotaExhausted(f"HTTP {response.status_code}: {response.text[:300]}")
+        if any(marker in body_text for marker in _RATELIMIT_MARKERS):
+            raise RateLimited(None)
 
     response.raise_for_status()
     return response.json()
+
+
+def request_page(api_key: str, query_text: str, page_token: str | None,
+                 counters: dict[str, float]) -> dict[str, Any]:
+    """Paced, self-retrying request. Waits out rate limits automatically so the
+    harvester keeps running unattended. Only raises QuotaExhausted when the key
+    is truly dead or we have been blocked continuously for too long."""
+    backoff = INITIAL_BACKOFF_SECONDS
+    while True:
+        time.sleep(REQUEST_SPACING_SECONDS)  # steady global pace
+        try:
+            payload = _perform_request(api_key, query_text, page_token)
+        except RateLimited as exc:
+            wait = min(exc.retry_after or backoff, MAX_BACKOFF_SECONDS)
+            logging.warning(
+                "Rate limited by Google (429). Waiting %ss, then continuing automatically "
+                "(nothing lost).", int(wait))
+            time.sleep(wait)
+            counters["stall"] = counters.get("stall", 0) + wait + REQUEST_SPACING_SECONDS
+            if counters["stall"] >= MAX_CONTINUOUS_STALL_SECONDS:
+                raise QuotaExhausted(
+                    f"continuously rate-limited for over "
+                    f"{int(MAX_CONTINUOUS_STALL_SECONDS // 3600)}h -- stopping for now")
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            continue
+        counters["requests"] = counters.get("requests", 0) + 1
+        counters["stall"] = 0  # a success clears the continuous-stall timer
+        return payload
 
 
 def fetch_places_for_city(api_key: str, city: dict[str, str], counters: dict[str, int]) -> list[dict[str, Any]]:
@@ -198,11 +256,10 @@ def fetch_places_for_city(api_key: str, city: dict[str, str], counters: dict[str
     page_token: str | None = None
 
     for _ in range(MAX_PAGES_PER_CITY):
-        if MAX_REQUESTS_PER_RUN is not None and counters["requests"] >= MAX_REQUESTS_PER_RUN:
+        if MAX_REQUESTS_PER_RUN is not None and counters.get("requests", 0) >= MAX_REQUESTS_PER_RUN:
             raise QuotaExhausted(f"local MAX_REQUESTS_PER_RUN cap ({MAX_REQUESTS_PER_RUN}) reached")
 
-        payload = request_page(api_key, query_text, page_token)
-        counters["requests"] += 1
+        payload = request_page(api_key, query_text, page_token, counters)
         places.extend(payload.get("places", []))
 
         page_token = payload.get("nextPageToken")
@@ -275,7 +332,7 @@ def main() -> int:
         logging.warning("City list changed since last run; restarting the sweep "
                         "(existing companies are still de-duplicated).")
 
-    counters = {"requests": 0}
+    counters: dict[str, float] = {"requests": 0, "stall": 0}
     total_added = int(progress.get("total_added", 0))
     known_ids = existing_place_ids()
 
