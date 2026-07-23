@@ -49,7 +49,10 @@ OUTPUT_FILE = PROJECT_DIR / "emails.tsv"
 STATE_FILE = PROJECT_DIR / "crawl_state.json"
 LOG_FILE = PROJECT_DIR / "scraper.log"
 
-MAX_SITES_PER_RUN = 40
+# None = keep crawling until every collected website has been processed (it is
+# resumable via crawl_state.json, so cancelling and re-running continues exactly
+# where it left off). Set an integer if you want to cap a single run instead.
+MAX_SITES_PER_RUN: int | None = None
 MAX_HTML_BYTES = 2_000_000
 # Slightly more conservative than before: gentler pacing is the cheapest, most
 # reliable way to stay under a site's rate thresholds and never look abusive.
@@ -601,7 +604,7 @@ def main() -> int:
     state = load_state()
 
     processed = 0
-    while processed < MAX_SITES_PER_RUN:
+    while MAX_SITES_PER_RUN is None or processed < MAX_SITES_PER_RUN:
         try:
             company = load_next_company(state)
         except (OSError, csv.Error) as exc:
