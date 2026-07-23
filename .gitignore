@@ -1,0 +1,13 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local pipeline data / secrets (never commit these)
+.env
+us_cities.csv
+places.tsv
+emails.tsv
+scraper.log
+crawl_state.json
+harvest_progress.json
+google_api_usage.json
